@@ -258,6 +258,61 @@ function addPersonCallback(el) {
     redrawPeople();
 }
 
+function _uploadIdCardCallback(el) {
+    var idCardPath = $("#uploadIdCardTxt").val();
+    if (idCardPath == "") return;
+    people.push(idCardPath);
+    $("#uploadIdCardTxt").val("");
+
+    if (socket != null) {
+        var msg = {
+            'type': 'SET_IDCARD',
+            'val': idCardPath
+        };
+        socket.send(JSON.stringify(msg));
+    }
+    redrawPeople();
+}
+
+function ab2str(buf) {
+  return String.fromCharCode.apply(null, new Uint8Array(buf));
+}
+
+
+function uploadIdCardCallback(el) {
+    var idCardPath = $("#uploadIdCardTxt").val();
+    if (idCardPath == "") return;
+    people.push(idCardPath);
+    redrawPeople();
+
+    var file = document.getElementById('uploadIdCardTxt').files[0];
+    socket.send('{"type": "SET_IDCARD", "val": "');
+    var reader = new FileReader();
+    var rawData = new ArrayBuffer();
+
+    reader.loadend = function() {
+
+    }
+    reader.onload = function(e) {
+        rawData = e.target.result;
+        pld = ab2str(rawData);
+        console.log("rawdata pld" + pld);
+
+        if (socket != null) {
+            var msg = {
+                'type': 'SET_IDCARD',
+                'val': pld
+            };
+            socket.send(JSON.stringify(msg));
+        }
+        console.log(msg);
+        alert("the File has been transferred.")
+   }
+
+    reader.readAsArrayBuffer(file);
+
+}
+
 function trainingChkCallback() {
     training = $("#trainingChk").prop('checked');
     if (training) {

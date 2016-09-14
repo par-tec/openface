@@ -37,6 +37,9 @@ import os
 import StringIO
 import urllib
 import base64
+import pickle
+import time
+from struct import pack
 
 from sklearn.decomposition import PCA
 from sklearn.grid_search import GridSearchCV
@@ -69,13 +72,14 @@ parser.add_argument('--port', type=int, default=9000,
 
 args = parser.parse_args()
 
+# Recognize the face using the dlibFacePredictor model.
 align = openface.AlignDlib(args.dlibFacePredictor)
 net = openface.TorchNeuralNet(args.networkModel, imgDim=args.imgDim,
                               cuda=args.cuda)
 
 
 class Face:
-
+    """A container class with debug code."""
     def __init__(self, rep, identity):
         self.rep = rep
         self.identity = identity
@@ -87,13 +91,66 @@ class Face:
         )
 
 
+def _stream_to_rgbFrame(imgdata):
+    """Return an rgbframe from a byte-sequence.
+    """
+    imgF = StringIO.StringIO()
+    imgF.write(imgdata)
+    imgF.seek(0)
+    # import pdb; pdb.set_trace()
+    img = Image.open(imgF)
+    buf = np.fliplr(np.asarray(img))
+    rgbFrame = np.zeros((img.size[1], img.size[0], 3), dtype=np.uint8)
+    rgbFrame[:, :, 0] = buf[:, :, 2]
+    rgbFrame[:, :, 1] = buf[:, :, 1]
+    rgbFrame[:, :, 2] = buf[:, :, 0]
+    return rgbFrame
+
+
+def getRep(imgPath):
+    """Detect a face in an image and returns the aligned representation."""
+
+    try:
+        is_file = os.path.isfile(imgPath)
+    except (TypeError, UnicodeError, OSError, IOError) as e:
+        is_file = False
+
+    if is_file:
+        bgrImg = cv2.imread(imgPath)
+        if bgrImg is None:
+            raise Exception("Unable to load image: {}".format(imgPath))
+        rgbImg = cv2.cvtColor(bgrImg, cv2.COLOR_BGR2RGB)
+    else:
+        rgbImg = _stream_to_rgbFrame(imgPath)
+        imgPath = "<datastream>"
+
+    bb = align.getLargestFaceBoundingBox(rgbImg)
+    if bb is None:
+        raise Exception("Unable to find a face: {}".format(imgPath))
+
+    alignedFace = align.align(args.imgDim, rgbImg, bb,
+                              landmarkIndices=openface.AlignDlib.OUTER_EYES_AND_NOSE)
+    if alignedFace is None:
+        raise Exception("Unable to align image: {}".format(imgPath))
+
+    rep = net.forward(alignedFace)
+    return rep
+
+
 class OpenFaceServerProtocol(WebSocketServerProtocol):
 
     def __init__(self):
         self.images = {}
         self.training = True
         self.people = []
-        self.svm = None
+
+        # In case you want to use a classifier.
+        with open("/code/features/classifier.pkl", 'r') as f:
+            (self.le, self.svm) = pickle.load(f)
+
+        # Use a zero face.
+        self.cid = np.zeros(128)
+
         if args.unknown:
             self.unknownImgs = np.load("./examples/web/unknown.npy")
 
@@ -105,8 +162,14 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
         print("WebSocket connection open.")
 
     def onMessage(self, payload, isBinary):
-        raw = payload.decode('utf8')
-        msg = json.loads(raw)
+        try:
+            raw = payload.decode('utf8')
+            msg = json.loads(raw)
+        except Exception as e:
+            print("Error processing msg: %r" % payload)
+            print(e)
+            return
+
         print("Received {} message of length {}.".format(
             msg['type'], len(raw)))
         if msg['type'] == "ALL_STATE":
@@ -131,6 +194,18 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
                     self.trainSVM()
             else:
                 print("Image not found.")
+
+
+
+        elif msg['type'] == "SET_IDCARD":
+            # XXX encode payload in base64 in js.
+            with open("/code/tmp.jpg", 'wb') as fh:
+                fh.write(msg['val'].encode('utf-8'))
+            payload = b''.join([pack(">B", x) for x in map(ord, msg['val'])])
+            self.cid = getRep(payload)
+
+
+
         elif msg['type'] == "REMOVE_IMAGE":
             h = msg['hash'].encode('ascii', 'ignore')
             if h in self.images:
@@ -142,7 +217,7 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
         elif msg['type'] == 'REQ_TSNE':
             self.sendTSNE(msg['people'])
         else:
-            print("Warning: Unknown message type: {}".format(msg['type']))
+            print("Warning: Unknown message type: {!r}".format(payload))
 
     def onClose(self, wasClean, code, reason):
         print("WebSocket connection closed: {0}".format(reason))
@@ -209,17 +284,21 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
             plt.scatter(X_r[y == i, 0], X_r[y == i, 1], c=c, label=name)
             plt.legend()
 
-        imgdata = StringIO.StringIO()
-        plt.savefig(imgdata, format='png')
-        imgdata.seek(0)
-
-        content = 'data:image/png;base64,' + \
-                  urllib.quote(base64.b64encode(imgdata.buf))
+        content = self._figure_to_stream()
         msg = {
             "type": "TSNE_DATA",
             "content": content
         }
         self.sendMessage(json.dumps(msg))
+
+    @staticmethod
+    def _figure_to_stream():
+        imgdata = StringIO.StringIO()
+        plt.savefig(imgdata, format='png')
+        imgdata.seek(0)
+        content = 'data:image/png;base64,' + \
+                  urllib.quote(base64.b64encode(imgdata.buf))
+        return content
 
     def trainSVM(self):
         print("+ Training SVM on {} labeled images.".format(len(self.images)))
@@ -243,6 +322,10 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
             self.svm = GridSearchCV(SVC(C=1), param_grid, cv=5).fit(X, y)
 
     def processFrame(self, dataURL, identity):
+        """Extract an image from the data passed to the server via js:
+            - in training mode, analyze and archive
+            - otherwise try to predict the identity.
+        """
         head = "data:image/jpeg;base64,"
         assert(dataURL.startswith(head))
         imgdata = base64.b64decode(dataURL[len(head):])
@@ -258,6 +341,7 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
         rgbFrame[:, :, 2] = buf[:, :, 0]
 
         if not self.training:
+            # Prepare the image to be presented on the screen.
             annotatedFrame = np.copy(buf)
 
         # cv2.imshow('frame', rgbFrame)
@@ -270,6 +354,7 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
         bbs = [bb] if bb is not None else []
         for bb in bbs:
             # print(len(bbs))
+            # There's just one face here, crop it ;)
             landmarks = align.findLandmarks(rgbFrame, bb)
             alignedFace = align.align(args.imgDim, rgbFrame, bb,
                                       landmarks=landmarks,
@@ -277,13 +362,18 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
             if alignedFace is None:
                 continue
 
+            # Create a perceptive hash from the webcam and look
+            #  into the actual images. It seems rarely used.
             phash = str(imagehash.phash(Image.fromarray(alignedFace)))
             if phash in self.images:
                 identity = self.images[phash].identity
+                rep = self.images[phash].rep
             else:
+                print("Phash not found in cache. Calculate the face representation.")
                 rep = net.forward(alignedFace)
                 # print(rep)
                 if self.training:
+                    # add phash to cache.
                     self.images[phash] = Face(rep, identity)
                     # TODO: Transferring as a string is suboptimal.
                     # content = [str(x) for x in cv2.resize(alignedFace, (0,0),
@@ -297,7 +387,7 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
                         "representation": rep.tolist()
                     }
                     self.sendMessage(json.dumps(msg))
-                else:
+                else:  # not training. looking into identities.
                     if len(self.people) == 0:
                         identity = -1
                     elif len(self.people) == 1:
@@ -310,7 +400,7 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
                     if identity not in identities:
                         identities.append(identity)
 
-            if not self.training:
+            if not self.training:  # Annotate frame.
                 bl = (bb.left(), bb.bottom())
                 tr = (bb.right(), bb.top())
                 cv2.rectangle(annotatedFrame, bl, tr, color=(153, 255, 204),
@@ -325,6 +415,10 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
                         name = "Unknown"
                 else:
                     name = self.people[identity]
+
+                # Distance between the face in the idcard and the webcam.
+                d = self.cid - rep
+                name = "dist: {:0.3f}".format(np.dot(d, d))
                 cv2.putText(annotatedFrame, name, (bb.left(), bb.top() - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.75,
                             color=(152, 255, 204), thickness=2)
@@ -336,22 +430,23 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
             }
             self.sendMessage(json.dumps(msg))
 
-            plt.figure()
-            plt.imshow(annotatedFrame)
-            plt.xticks([])
-            plt.yticks([])
-
-            imgdata = StringIO.StringIO()
-            plt.savefig(imgdata, format='png')
-            imgdata.seek(0)
-            content = 'data:image/png;base64,' + \
-                urllib.quote(base64.b64encode(imgdata.buf))
+            content = self._create_figure_from_frame(annotatedFrame)
             msg = {
                 "type": "ANNOTATED",
                 "content": content
             }
             plt.close()
             self.sendMessage(json.dumps(msg))
+
+    @staticmethod
+    def _create_figure_from_frame(annotatedFrame):
+        plt.figure()
+        plt.imshow(annotatedFrame)
+        plt.xticks([])
+        plt.yticks([])
+        content = OpenFaceServerProtocol._figure_to_stream()
+        return content
+
 
 if __name__ == '__main__':
     log.startLogging(sys.stdout)

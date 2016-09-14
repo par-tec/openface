@@ -90,6 +90,19 @@ limitations under the License.
                         </button>
                     </span>
                 </div>
+                <div class="input-group uploadIdCardDiv">
+                    <label class="btn btn-default btn-file">
+                        <input class="file"  type="file" id="uploadIdCardTxt">
+                        <progress></progress>
+
+                    </label>
+                    <span class="input-group-btn">
+                        <button class="btn btn-default" type="button"
+                                id="uploadIdCardBtn">
+                            Upload ID Card
+                        </button>
+                    </span>
+                </div>
                 <br/>
                 <div>
                     <button class="btn btn-default" type="button"
@@ -229,6 +242,8 @@ limitations under the License.
      $("#serverBtn.btn-group > .btn").click(changeServerCallback);
      $("#addPersonBtn").click(addPersonCallback);
      $("#addPersonTxt").pressEnter(addPersonCallback);
+     $("#uploadIdCardBtn").click(uploadIdCardCallback);
+     $("#uploadIdCardTxt").pressEnter(uploadIdCardCallback);
      $("#trainingChk").change(trainingChkCallback);
      $("#viewTSNEBtn").click(viewTSNECallback);
 
