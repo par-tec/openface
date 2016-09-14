@@ -144,10 +144,6 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
         self.training = True
         self.people = []
 
-        # In case you want to use a classifier.
-        with open("/code/features/classifier.pkl", 'r') as f:
-            (self.le, self.svm) = pickle.load(f)
-
         # Use a zero face.
         self.cid = np.zeros(128)
 
@@ -198,9 +194,6 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
 
 
         elif msg['type'] == "SET_IDCARD":
-            # XXX encode payload in base64 in js.
-            with open("/code/tmp.jpg", 'wb') as fh:
-                fh.write(msg['val'].encode('utf-8'))
             payload = b''.join([pack(">B", x) for x in map(ord, msg['val'])])
             self.cid = getRep(payload)
 

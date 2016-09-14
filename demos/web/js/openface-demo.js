@@ -286,7 +286,6 @@ function uploadIdCardCallback(el) {
     redrawPeople();
 
     var file = document.getElementById('uploadIdCardTxt').files[0];
-    socket.send('{"type": "SET_IDCARD", "val": "');
     var reader = new FileReader();
     var rawData = new ArrayBuffer();
 
