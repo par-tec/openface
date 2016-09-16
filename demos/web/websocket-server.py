@@ -136,6 +136,7 @@ def getRep(imgPath):
     rep = net.forward(alignedFace)
     return rep
 
+from collections import defaultdict
 
 class OpenFaceServerProtocol(WebSocketServerProtocol):
 
@@ -146,9 +147,17 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
 
         # Use a zero face.
         self.cid = np.zeros(128)
+        self.cid_stats = self._reset_stats()
 
         if args.unknown:
             self.unknownImgs = np.load("./examples/web/unknown.npy")
+
+    def _reset_stats(self):
+        return {
+            'max': 0.0,
+            'min': 2.0,
+            'history': []
+        }
 
     def onConnect(self, request):
         print("Client connecting: {0}".format(request.peer))
@@ -179,36 +188,10 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
             self.training = msg['val']
             if not self.training:
                 self.trainSVM()
-        elif msg['type'] == "ADD_PERSON":
-            self.people.append(msg['val'].encode('ascii', 'ignore'))
-            print(self.people)
-        elif msg['type'] == "UPDATE_IDENTITY":
-            h = msg['hash'].encode('ascii', 'ignore')
-            if h in self.images:
-                self.images[h].identity = msg['idx']
-                if not self.training:
-                    self.trainSVM()
-            else:
-                print("Image not found.")
-
-
-
         elif msg['type'] == "SET_IDCARD":
             payload = b''.join([pack(">B", x) for x in map(ord, msg['val'])])
             self.cid = getRep(payload)
-
-
-
-        elif msg['type'] == "REMOVE_IMAGE":
-            h = msg['hash'].encode('ascii', 'ignore')
-            if h in self.images:
-                del self.images[h]
-                if not self.training:
-                    self.trainSVM()
-            else:
-                print("Image not found.")
-        elif msg['type'] == 'REQ_TSNE':
-            self.sendTSNE(msg['people'])
+            self.cid_stats = self._reset_stats()
         else:
             print("Warning: Unknown message type: {!r}".format(payload))
 
@@ -226,93 +209,15 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
         for jsPerson in jsPeople:
             self.people.append(jsPerson.encode('ascii', 'ignore'))
 
-        if not training:
-            self.trainSVM()
-
-    def getData(self):
-        X = []
-        y = []
-        for img in self.images.values():
-            X.append(img.rep)
-            y.append(img.identity)
-
-        numIdentities = len(set(y + [-1])) - 1
-        if numIdentities == 0:
-            return None
-
-        if args.unknown:
-            numUnknown = y.count(-1)
-            numIdentified = len(y) - numUnknown
-            numUnknownAdd = (numIdentified / numIdentities) - numUnknown
-            if numUnknownAdd > 0:
-                print("+ Augmenting with {} unknown images.".format(numUnknownAdd))
-                for rep in self.unknownImgs[:numUnknownAdd]:
-                    # print(rep)
-                    X.append(rep)
-                    y.append(-1)
-
-        X = np.vstack(X)
-        y = np.array(y)
-        return (X, y)
-
-    def sendTSNE(self, people):
-        d = self.getData()
-        if d is None:
-            return
-        else:
-            (X, y) = d
-
-        X_pca = PCA(n_components=50).fit_transform(X, X)
-        tsne = TSNE(n_components=2, init='random', random_state=0)
-        X_r = tsne.fit_transform(X_pca)
-
-        yVals = list(np.unique(y))
-        colors = cm.rainbow(np.linspace(0, 1, len(yVals)))
-
-        # print(yVals)
-
-        plt.figure()
-        for c, i in zip(colors, yVals):
-            name = "Unknown" if i == -1 else people[i]
-            plt.scatter(X_r[y == i, 0], X_r[y == i, 1], c=c, label=name)
-            plt.legend()
-
-        content = self._figure_to_stream()
-        msg = {
-            "type": "TSNE_DATA",
-            "content": content
-        }
-        self.sendMessage(json.dumps(msg))
-
     @staticmethod
     def _figure_to_stream():
         imgdata = StringIO.StringIO()
         plt.savefig(imgdata, format='png')
+        plt.close()
         imgdata.seek(0)
         content = 'data:image/png;base64,' + \
                   urllib.quote(base64.b64encode(imgdata.buf))
         return content
-
-    def trainSVM(self):
-        print("+ Training SVM on {} labeled images.".format(len(self.images)))
-        d = self.getData()
-        if d is None:
-            self.svm = None
-            return
-        else:
-            (X, y) = d
-            numIdentities = len(set(y + [-1]))
-            if numIdentities <= 1:
-                return
-
-            param_grid = [
-                {'C': [1, 10, 100, 1000],
-                 'kernel': ['linear']},
-                {'C': [1, 10, 100, 1000],
-                 'gamma': [0.001, 0.0001],
-                 'kernel': ['rbf']}
-            ]
-            self.svm = GridSearchCV(SVC(C=1), param_grid, cv=5).fit(X, y)
 
     def processFrame(self, dataURL, identity):
         """Extract an image from the data passed to the server via js:
@@ -333,103 +238,59 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
         rgbFrame[:, :, 1] = buf[:, :, 1]
         rgbFrame[:, :, 2] = buf[:, :, 0]
 
-        if not self.training:
-            # Prepare the image to be presented on the screen.
-            annotatedFrame = np.copy(buf)
+        # Prepare the image to be presented on the screen.
+        annotatedFrame = np.copy(buf)
 
-        # cv2.imshow('frame', rgbFrame)
-        # if cv2.waitKey(1) & 0xFF == ord('q'):
-        #     return
-
-        identities = []
-        # bbs = align.getAllFaceBoundingBoxes(rgbFrame)
         bb = align.getLargestFaceBoundingBox(rgbFrame)
-        bbs = [bb] if bb is not None else []
-        for bb in bbs:
-            # print(len(bbs))
-            # There's just one face here, crop it ;)
-            landmarks = align.findLandmarks(rgbFrame, bb)
-            alignedFace = align.align(args.imgDim, rgbFrame, bb,
-                                      landmarks=landmarks,
-                                      landmarkIndices=openface.AlignDlib.OUTER_EYES_AND_NOSE)
-            if alignedFace is None:
-                continue
 
-            # Create a perceptive hash from the webcam and look
-            #  into the actual images. It seems rarely used.
-            phash = str(imagehash.phash(Image.fromarray(alignedFace)))
-            if phash in self.images:
-                identity = self.images[phash].identity
-                rep = self.images[phash].rep
-            else:
-                print("Phash not found in cache. Calculate the face representation.")
-                rep = net.forward(alignedFace)
-                # print(rep)
-                if self.training:
-                    # add phash to cache.
-                    self.images[phash] = Face(rep, identity)
-                    # TODO: Transferring as a string is suboptimal.
-                    # content = [str(x) for x in cv2.resize(alignedFace, (0,0),
-                    # fx=0.5, fy=0.5).flatten()]
-                    content = [str(x) for x in alignedFace.flatten()]
-                    msg = {
-                        "type": "NEW_IMAGE",
-                        "hash": phash,
-                        "content": content,
-                        "identity": identity,
-                        "representation": rep.tolist()
-                    }
-                    self.sendMessage(json.dumps(msg))
-                else:  # not training. looking into identities.
-                    if len(self.people) == 0:
-                        identity = -1
-                    elif len(self.people) == 1:
-                        identity = 0
-                    elif self.svm:
-                        identity = self.svm.predict(rep)[0]
-                    else:
-                        print("hhh")
-                        identity = -1
-                    if identity not in identities:
-                        identities.append(identity)
+        if bb is None:
+            return
 
-            if not self.training:  # Annotate frame.
-                bl = (bb.left(), bb.bottom())
-                tr = (bb.right(), bb.top())
-                cv2.rectangle(annotatedFrame, bl, tr, color=(153, 255, 204),
-                              thickness=3)
-                for p in openface.AlignDlib.OUTER_EYES_AND_NOSE:
-                    cv2.circle(annotatedFrame, center=landmarks[p], radius=3,
-                               color=(102, 204, 255), thickness=-1)
-                if identity == -1:
-                    if len(self.people) == 1:
-                        name = self.people[0]
-                    else:
-                        name = "Unknown"
-                else:
-                    name = self.people[identity]
+        landmarks = align.findLandmarks(rgbFrame, bb)
+        alignedFace = align.align(args.imgDim, rgbFrame, bb,
+                                  landmarks=landmarks,
+                                  landmarkIndices=openface.AlignDlib.OUTER_EYES_AND_NOSE)
+        if alignedFace is None:
+            return
 
-                # Distance between the face in the idcard and the webcam.
-                d = self.cid - rep
-                name = "dist: {:0.3f}".format(np.dot(d, d))
-                cv2.putText(annotatedFrame, name, (bb.left(), bb.top() - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.75,
-                            color=(152, 255, 204), thickness=2)
+        # Create a perceptive hash from the webcam and look
+        #  into the actual images. It seems rarely used.
+        phash = str(imagehash.phash(Image.fromarray(alignedFace)))
+        if phash in self.images:
+            rep = self.images[phash].rep
+        else:
+            print("Phash not found in cache. Calculate the face representation.")
+            rep = net.forward(alignedFace)
 
-        if not self.training:
-            msg = {
-                "type": "IDENTITIES",
-                "identities": identities
-            }
-            self.sendMessage(json.dumps(msg))
+        # Create the annotated frame.
+        bl = (bb.left(), bb.bottom())
+        tr = (bb.right(), bb.top())
+        cv2.rectangle(annotatedFrame, bl, tr, color=(153, 255, 204),
+                      thickness=3)
+        for p in openface.AlignDlib.OUTER_EYES_AND_NOSE:
+            cv2.circle(annotatedFrame, center=landmarks[p], radius=3,
+                       color=(102, 204, 255), thickness=-1)
 
-            content = self._create_figure_from_frame(annotatedFrame)
-            msg = {
-                "type": "ANNOTATED",
-                "content": content
-            }
-            plt.close()
-            self.sendMessage(json.dumps(msg))
+        # Distance^2 between the face in the idcard and the webcam.
+        d = self.cid - rep
+        d2 = np.dot(d, d)
+        self.cid_stats = {
+            'min': min(self.cid_stats['min'], d2),
+            'max': max(self.cid_stats['max'], d2)
+        }
+        name = "d: {:0.2f}\n" \
+               "M: {:0.2f}\n" \
+               "m: {:0.2f}".format(np.sqrt(d2), self.cid_stats['max'], self.cid_stats['min'])
+        cv2.putText(annotatedFrame, name, (bb.left(), bb.top() - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.75,
+                    color=(152, 255, 204), thickness=2)
+
+        content = self._create_figure_from_frame(annotatedFrame)
+        msg = {
+            "type": "ANNOTATED",
+            "content": content
+        }
+        self.sendMessage(json.dumps(msg))
 
     @staticmethod
     def _create_figure_from_frame(annotatedFrame):
